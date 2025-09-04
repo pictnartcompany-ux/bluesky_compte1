@@ -1,0 +1,23 @@
+name: post-once
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "Texte à poster sur Bluesky"
+        required: true
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install deps
+        run: pip install atproto>=0.0.45
+      - name: Post to Bluesky
+        env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          POST_TEXT: ${{ github.event.inputs.text }}
+        run: python post_once.py

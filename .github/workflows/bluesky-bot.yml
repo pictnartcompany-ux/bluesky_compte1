@@ -1,0 +1,55 @@
+name: Bluesky Bot (Loufi's Art)
+
+on:
+  schedule:
+    # Toutes les 30 minutes. GitHub Actions utilise l'heure UTC.
+    # Ton bot choisit lui-même quoi faire en fonction de l'heure Europe/Brussels.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: bluesky-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot (one-shot)
+        env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+        run: |
+          python bluesky_bot.py --oneshot
+
+      - name: Upload state (artifact)  # pour debug si besoin
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state
+          path: |
+            bluesky_bot_state.json
+          if-no-files-found: ignore

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 Bluesky bot (Loufi’s Art) — GitHub Actions friendly
+- Postes texte (GM/GN/valeur/NFT) + engagements (likes/reposts/réponses)
+- Ajout d'une image sous le texte surtout pour GM (matin) & GN (soir)
+- Anti-répétition (texte 7j, images 14j par défaut)
+- Mode --oneshot pour GitHub Actions (fait 1 action et sort)
 
-Usage locally:
-  pip install -r requirements.txt
+Usage local:
+  pip install atproto
   export BSKY_HANDLE=your_handle.bsky.social
   export BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-  python bluesky_bot.py --loop        # boucle continue
-  python bluesky_bot.py --oneshot     # fait 1 action puis sort (pour GitHub Actions)
+  python bluesky_bot.py --oneshot
 
-Notes:
-- Timezone: Europe/Brussels
-- Anti-répétition: évite de poster le même texte dans les 7 derniers jours
+Dépôts:
+  - Place tes images dans assets/posts/ (jpg/jpeg/png)
 """
 
 import os
@@ -23,6 +25,7 @@ import argparse
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
+import pathlib
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -32,28 +35,39 @@ except ImportError:
 # Bluesky SDK
 from atproto import Client, models as M
 
-# --------------- USER CONFIG ---------------
+# ---------- USER CONFIG ----------
 
 SITE_URL = "https://louphi1987.github.io/Site_de_Louphi/"
 OPENSEA_URL = "https://opensea.io/collection/loufis-art"
 TIMEZONE = "Europe/Brussels"
 
-# Caps par jour (utiles même en oneshot si GitHub Actions déclenche souvent)
+# Dossier des images locales à joindre aux posts
+IMAGES_DIR = "assets/posts"
+ALLOWED_EXTS = {".jpg", ".jpeg", ".png"}
+IMAGE_RECENCY_DAYS = 14  # évite de reposter la même image pendant X jours
+
+# Limites / jour (protège contre l’aspect bot/spam)
 MAX_POSTS_PER_DAY = 4
 MAX_ENGAGEMENTS_PER_DAY = 12
 
-# Poids par type d’action
+# Poids des actions
 WEIGHTS = {
-    "post_gm": 0.20,
+    "post_gm": 0.23,     # un peu plus le matin
     "post_value": 0.22,
-    "post_nft": 0.18,
-    "post_gn": 0.20,
-    "engage": 0.20,
+    "post_nft": 0.16,
+    "post_gn": 0.22,     # un peu plus le soir
+    "engage": 0.17,
 }
 
+# Probabilité de joindre une image aux GM/GN (selon créneau)
+ATTACH_IMAGE_PROB_MORNING_GM = 0.55  # 55% des GM (7–11h) auront une image
+ATTACH_IMAGE_PROB_EVENING_GN = 0.60  # 60% des GN (19–23h) auront une image
+ATTACH_IMAGE_PROB_OTHER = 0.15       # en dehors de ces fenêtres (faible)
+
+# Hashtags pour trouver des posts à liker/reposter/commenter
 DISCOVERY_TAGS = ["art", "nft", "digitalart", "artist", "illustration", "aiart"]
 
-# --------------- TEXT LIBRARIES ---------------
+# ---------- TEXT LIBRARIES ----------
 
 GM_POSTS = [
     "GM ☀️✨ Wishing everyone a day full of creativity and inspiration!",
@@ -64,6 +78,7 @@ GM_POSTS = [
 ]
 
 GN_SHORT_BASE = ["GN", "Gn", "gn", "Good night", "Night"]
+RANDOM_GN_EMOJIS = ["🌙", "✨", "⭐", "💤", "🌌", "🫶", "💫", "😴", "🌠"]
 
 GN_LONG = [
     "Good night 🌙💫 May your dreams be as colorful as art.",
@@ -71,8 +86,6 @@ GN_LONG = [
     "Calling it a day — see you among the stars 🌠 GN!",
     "Resting the canvas for tomorrow’s colors. GN ✨",
 ]
-
-RANDOM_GN_EMOJIS = ["🌙", "✨", "⭐", "💤", "🌌", "🫶", "💫", "😴", "🌠"]
 
 VALUE_POSTS = [
     "Fiction isn’t just escape — it’s expansion. Art gives it a shape. 🎨✨ Explore my worlds: {site}",
@@ -98,10 +111,9 @@ COMMENT_SHORT = [
     "Beautiful palette 💫",
     "So much atmosphere here!",
 ]
-
 COMMENT_EMOJIS = ["🔥", "👍", "👏", "😍", "✨", "🫶", "🎉", "💯", "🤝", "⚡", "🌟"]
 
-# --------------- STATE PERSISTENCE ---------------
+# ---------- STATE PERSISTENCE ----------
 
 STATE_FILE = "bluesky_bot_state.json"
 
@@ -134,15 +146,71 @@ def remember_post(state: Dict[str, Any], text: str) -> None:
 def recently_used(state: Dict[str, Any], text: str, days: int = 7) -> bool:
     cutoff = dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(days=days)
     for item in reversed(state["history"]):
+        ts = item.get("ts")
+        if not ts:
+            continue
         try:
-            ts = dt.datetime.fromisoformat(item["ts"])
+            ts = dt.datetime.fromisoformat(ts)
         except Exception:
             continue
-        if ts >= cutoff and item["text"].strip() == text.strip():
+        if ts >= cutoff and item.get("text", "").strip() == text.strip():
             return True
     return False
 
-# --------------- BLUESKY HELPERS ---------------
+# ---------- IMAGE HELPERS ----------
+
+def list_local_images(folder: str) -> list[str]:
+    p = pathlib.Path(folder)
+    if not p.exists():
+        return []
+    files = []
+    for f in p.iterdir():
+        if f.is_file() and f.suffix.lower() in ALLOWED_EXTS:
+            files.append(str(f))
+    return files
+
+def recently_used_media(state: Dict[str, Any], media_path: str, days: int = IMAGE_RECENCY_DAYS) -> bool:
+    cutoff = dt.datetime.now(tz=dt.timezone.utc) - dt.timedelta(days=days)
+    for item in reversed(state.get("history", [])):
+        ts = item.get("ts")
+        media = item.get("media")
+        if not ts or not media:
+            continue
+        try:
+            ts = dt.datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if ts >= cutoff and media == media_path:
+            return True
+    return False
+
+def remember_post_with_media(state: Dict[str, Any], text: str, media_path: str) -> None:
+    now = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+    state["history"].append({"text": text, "media": media_path, "ts": now})
+    state["history"] = state["history"][-300:]
+
+def post_text_with_optional_image(client: Client, text: str, maybe_image: Optional[str]) -> Optional[str]:
+    """Poste un texte, et si maybe_image est fourni, l'embarque sous forme d'image embed."""
+    try:
+        if not maybe_image:
+            resp = client.send_post(text=text)
+            return getattr(resp, "uri", None)
+
+        with open(maybe_image, "rb") as f:
+            blob = client.upload_blob(f.read())
+
+        # selon versions du SDK: blob.blob ou blob.data
+        image_ref = getattr(blob, "blob", None) or getattr(blob, "data", None)
+        embed = M.AppBskyEmbedImages.Main(
+            images=[M.AppBskyEmbedImages.Image(alt="Artwork from Loufi’s Art", image=image_ref)]
+        )
+        resp = client.send_post(text=text, embed=embed)
+        return getattr(resp, "uri", None)
+    except Exception as e:
+        print(f"[post_text_with_optional_image] Error: {e}", file=sys.stderr)
+        return None
+
+# ---------- BLUESKY HELPERS ----------
 
 def bsky_login() -> Client:
     handle = os.getenv("BSKY_HANDLE", "").strip()
@@ -196,7 +264,7 @@ def reply_to_post(client: Client, parent_uri: str, parent_cid: str, text: str) -
         print(f"[reply_to_post] Error: {e}", file=sys.stderr)
         return False
 
-# --------------- CONTENT PICKERS ---------------
+# ---------- CONTENT PICKERS ----------
 
 def pick_without_recent(state: Dict[str, Any], pool: List[str]) -> str:
     shuffled = pool[:]
@@ -230,7 +298,7 @@ def pick_comment_text() -> str:
         return random.choice(COMMENT_EMOJIS)
     return random.choice(COMMENT_SHORT)
 
-# --------------- SCHEDULING / RHYTHM ---------------
+# ---------- SCHEDULING / RHYTHM ----------
 
 def in_time_window(now_local: dt.datetime, window: str) -> bool:
     hh = now_local.hour
@@ -249,17 +317,16 @@ def choose_action(now_local: dt.datetime, daily: DailyCounters) -> str:
            else "off")
     weights = WEIGHTS.copy()
     if win == "morning":
-        weights["post_gm"] += 0.20
+        weights["post_gm"] += 0.18
         weights["post_gn"] -= 0.10
     elif win == "evening":
-        weights["post_gn"] += 0.25
+        weights["post_gn"] += 0.22
 
     can_post = daily.posts < MAX_POSTS_PER_DAY
     can_engage = daily.engagements < MAX_ENGAGEMENTS_PER_DAY
 
     options = [(k, w) for k, w in weights.items()
                if (k.startswith("post") and can_post) or (k == "engage" and can_engage)]
-
     if not options:
         return "none"
 
@@ -272,7 +339,30 @@ def choose_action(now_local: dt.datetime, daily: DailyCounters) -> str:
             return k
     return options[-1][0]
 
-# --------------- TICK (one action) ---------------
+def should_attach_image(now_local: dt.datetime, kind: str) -> bool:
+    """Décide si on attache une image au post (surtout GM matin / GN soir)."""
+    if kind == "post_gm":
+        if in_time_window(now_local, "morning"):
+            return random.random() < ATTACH_IMAGE_PROB_MORNING_GM
+        return random.random() < ATTACH_IMAGE_PROB_OTHER
+    if kind == "post_gn":
+        if in_time_window(now_local, "evening"):
+            return random.random() < ATTACH_IMAGE_PROB_EVENING_GN
+        return random.random() < ATTACH_IMAGE_PROB_OTHER
+    return random.random() < ATTACH_IMAGE_PROB_OTHER
+
+def pick_fresh_image(state: Dict[str, Any]) -> Optional[str]:
+    images = list_local_images(IMAGES_DIR)
+    if not images:
+        return None
+    random.shuffle(images)
+    for img in images:
+        if not recently_used_media(state, img, days=IMAGE_RECENCY_DAYS):
+            return img
+    # fallback si tout est “récent”
+    return random.choice(images)
+
+# ---------- ONE ACTION (for --oneshot) ----------
 
 def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
     now_local = dt.datetime.now(tz)
@@ -287,17 +377,27 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
     if action == "none":
         return "skip"
 
+    # POST (GM/value/NFT/GN) — avec possibilité d'image jointe pour GM/GN
     if action.startswith("post"):
         text = pick_post_text(state, action)
-        if post_text(client, text):
-            remember_post(state, text)
+        image_to_attach = None
+        if action in ("post_gm", "post_gn") and should_attach_image(now_local, action):
+            image_to_attach = pick_fresh_image(state)
+
+        uri = post_text_with_optional_image(client, text, image_to_attach)
+        if uri:
+            if image_to_attach:
+                remember_post_with_media(state, text, image_to_attach)
+            else:
+                remember_post(state, text)
             state["daily"]["posts"] += 1
             save_state(state)
-            print(f"Posted: {text}")
+            print(f"Posted: {text} {'[+ image]' if image_to_attach else ''}")
             return "posted"
         print("Post failed")
         return "post_failed"
 
+    # ENGAGE (like/repost/reply)
     if action == "engage":
         posts = search_recent_posts(client, DISCOVERY_TAGS, limit=30)
         random.shuffle(posts)
@@ -329,28 +429,27 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
 
     return "unknown"
 
-# --------------- MAIN ---------------
+# ---------- MAIN ----------
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--oneshot", action="store_true", help="Perform one action and exit (GitHub Actions mode)")
-    parser.add_argument("--loop", action="store_true", help="Run continuous loop with sleeps")
+    parser.add_argument("--loop", action="store_true", help="Run continuous loop with sleeps (local use)")
     args = parser.parse_args()
 
     tz = ZoneInfo(TIMEZONE)
     client = bsky_login()
     state = load_state()
 
-    if args.oneshot:
+    if args.oneshot or not args.loop:
         status = do_one_action(client, state, tz)
         print(f"Status: {status}")
         sys.exit(0)
 
-    # default to loop if --loop given (or nothing passed locally)
+    # loop local (si tu veux le faire tourner en continu chez toi)
     print("Loop mode. Ctrl+C to stop.")
     while True:
         do_one_action(client, state, tz)
-        # si tu utilises loop localement, on dort entre 25–55 min
         nap = random.uniform(25*60, 55*60)
         if random.random() < 0.18:
             nap += random.uniform(20*60, 40*60)

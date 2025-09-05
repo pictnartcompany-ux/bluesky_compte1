@@ -42,7 +42,7 @@ OPENSEA_URL = "https://opensea.io/collection/loufis-art"
 TIMEZONE = "Europe/Brussels"
 
 # Dossier des images locales à joindre aux posts
-IMAGES_DIR = "assets/posts"
+IMAGES_DIR = "."
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png"}
 IMAGE_RECENCY_DAYS = 14  # évite de reposter la même image pendant X jours
 

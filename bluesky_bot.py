@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Bluesky bot (Loufi’s Art) — balanced, semi-random activity with anti-repetition
+Bluesky bot (Loufi’s Art) — GitHub Actions friendly
 
-Requirements:
-  pip install atproto python-dotenv
+Usage locally:
+  pip install -r requirements.txt
+  export BSKY_HANDLE=your_handle.bsky.social
+  export BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+  python bluesky_bot.py --loop        # boucle continue
+  python bluesky_bot.py --oneshot     # fait 1 action puis sort (pour GitHub Actions)
 
-Usage:
-  1) Create an app password on Bluesky: Settings → Advanced → App Passwords.
-  2) Create a .env in the same folder with:
-        BSKY_HANDLE=your_handle.bsky.social
-        BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-  3) Run:
-        python bluesky_bot.py
+Notes:
+- Timezone: Europe/Brussels
+- Anti-répétition: évite de poster le même texte dans les 7 derniers jours
 """
 
 import os
@@ -19,6 +19,7 @@ import sys
 import json
 import time
 import random
+import argparse
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
@@ -28,8 +29,6 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
-from dotenv import load_dotenv
-
 # Bluesky SDK
 from atproto import Client, models as M
 
@@ -37,23 +36,22 @@ from atproto import Client, models as M
 
 SITE_URL = "https://louphi1987.github.io/Site_de_Louphi/"
 OPENSEA_URL = "https://opensea.io/collection/loufis-art"
-
 TIMEZONE = "Europe/Brussels"
 
+# Caps par jour (utiles même en oneshot si GitHub Actions déclenche souvent)
 MAX_POSTS_PER_DAY = 4
 MAX_ENGAGEMENTS_PER_DAY = 12
 
+# Poids par type d’action
 WEIGHTS = {
     "post_gm": 0.20,
     "post_value": 0.22,
     "post_nft": 0.18,
     "post_gn": 0.20,
-    "engage": 0.20
+    "engage": 0.20,
 }
 
 DISCOVERY_TAGS = ["art", "nft", "digitalart", "artist", "illustration", "aiart"]
-
-SLEEP_RANGE_SECONDS = (25 * 60, 55 * 60)
 
 # --------------- TEXT LIBRARIES ---------------
 
@@ -98,6 +96,7 @@ COMMENT_SHORT = [
     "Big fan of your style ✨",
     "Great composition 👏",
     "Beautiful palette 💫",
+    "So much atmosphere here!",
 ]
 
 COMMENT_EMOJIS = ["🔥", "👍", "👏", "😍", "✨", "🫶", "🎉", "💯", "🤝", "⚡", "🌟"]
@@ -149,7 +148,7 @@ def bsky_login() -> Client:
     handle = os.getenv("BSKY_HANDLE", "").strip()
     app_pw = os.getenv("BSKY_APP_PASSWORD", "").strip()
     if not handle or not app_pw:
-        print("ERROR: Missing BSKY_HANDLE or BSKY_APP_PASSWORD in .env", file=sys.stderr)
+        print("ERROR: Missing BSKY_HANDLE or BSKY_APP_PASSWORD in environment", file=sys.stderr)
         sys.exit(1)
     client = Client()
     client.login(handle, app_pw)
@@ -249,7 +248,6 @@ def choose_action(now_local: dt.datetime, daily: DailyCounters) -> str:
            else "evening" if in_time_window(now_local, "evening")
            else "off")
     weights = WEIGHTS.copy()
-
     if win == "morning":
         weights["post_gm"] += 0.20
         weights["post_gn"] -= 0.10
@@ -262,6 +260,9 @@ def choose_action(now_local: dt.datetime, daily: DailyCounters) -> str:
     options = [(k, w) for k, w in weights.items()
                if (k.startswith("post") and can_post) or (k == "engage" and can_engage)]
 
+    if not options:
+        return "none"
+
     total = sum(w for _, w in options)
     r = random.random() * total
     cum = 0.0
@@ -271,84 +272,93 @@ def choose_action(now_local: dt.datetime, daily: DailyCounters) -> str:
             return k
     return options[-1][0]
 
-# --------------- MAIN LOOP ---------------
+# --------------- TICK (one action) ---------------
+
+def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
+    now_local = dt.datetime.now(tz)
+    reset_daily_counters_if_needed(state, now_local)
+    daily = DailyCounters(
+        date=state["daily"]["date"],
+        posts=state["daily"]["posts"],
+        engagements=state["daily"]["engagements"],
+    )
+
+    action = choose_action(now_local, daily)
+    if action == "none":
+        return "skip"
+
+    if action.startswith("post"):
+        text = pick_post_text(state, action)
+        if post_text(client, text):
+            remember_post(state, text)
+            state["daily"]["posts"] += 1
+            save_state(state)
+            print(f"Posted: {text}")
+            return "posted"
+        print("Post failed")
+        return "post_failed"
+
+    if action == "engage":
+        posts = search_recent_posts(client, DISCOVERY_TAGS, limit=30)
+        random.shuffle(posts)
+        target_n = random.choice([2, 2, 3])
+        done = 0
+        for p in posts:
+            if state["daily"]["engagements"] >= MAX_ENGAGEMENTS_PER_DAY:
+                break
+            if not getattr(p, "uri", None) or not getattr(p, "cid", None):
+                continue
+            r = random.random()
+            if r < 0.65:
+                success = like_post(client, p.uri, p.cid); action_name = "like"
+            elif r < 0.80:
+                success = repost_post(client, p.uri, p.cid); action_name = "repost"
+            else:
+                reply_text = pick_comment_text()
+                success = reply_to_post(client, p.uri, p.cid, reply_text)
+                action_name = f"reply({reply_text})"
+            if success:
+                state["daily"]["engagements"] += 1
+                done += 1
+                print(f"Engaged: {action_name} on {p.uri}")
+                time.sleep(random.uniform(2.0, 5.0))
+            if done >= target_n:
+                break
+        save_state(state)
+        return "engaged"
+
+    return "unknown"
+
+# --------------- MAIN ---------------
 
 def main():
-    load_dotenv()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--oneshot", action="store_true", help="Perform one action and exit (GitHub Actions mode)")
+    parser.add_argument("--loop", action="store_true", help="Run continuous loop with sleeps")
+    args = parser.parse_args()
+
     tz = ZoneInfo(TIMEZONE)
     client = bsky_login()
-
     state = load_state()
-    print("Bluesky bot is running. Press Ctrl+C to stop.")
 
+    if args.oneshot:
+        status = do_one_action(client, state, tz)
+        print(f"Status: {status}")
+        sys.exit(0)
+
+    # default to loop if --loop given (or nothing passed locally)
+    print("Loop mode. Ctrl+C to stop.")
     while True:
-        try:
-            now_local = dt.datetime.now(tz)
-            reset_daily_counters_if_needed(state, now_local)
-            daily = DailyCounters(
-                date=state["daily"]["date"],
-                posts=state["daily"]["posts"],
-                engagements=state["daily"]["engagements"],
-            )
-
-            action = choose_action(now_local, daily)
-            print(f"[{now_local.isoformat()}] Decided action: {action}")
-
-            if action.startswith("post"):
-                text = pick_post_text(state, action)
-                if post_text(client, text):
-                    print(f"Posted: {text}")
-                    remember_post(state, text)
-                    state["daily"]["posts"] += 1
-            elif action == "engage":
-                posts = search_recent_posts(client, DISCOVERY_TAGS, limit=30)
-                random.shuffle(posts)
-                target_n = random.choice([2, 2, 3])
-                done = 0
-                for p in posts:
-                    if state["daily"]["engagements"] >= MAX_ENGAGEMENTS_PER_DAY:
-                        break
-                    if not getattr(p, "uri", None) or not getattr(p, "cid", None):
-                        continue
-
-                    r = random.random()
-                    if r < 0.65:
-                        success = like_post(client, p.uri, p.cid)
-                        action_name = "like"
-                    elif r < 0.80:
-                        success = repost_post(client, p.uri, p.cid)
-                        action_name = "repost"
-                    else:
-                        reply_text = pick_comment_text()
-                        success = reply_to_post(client, p.uri, p.cid, reply_text)
-                        action_name = f"reply({reply_text})"
-
-                    if success:
-                        state["daily"]["engagements"] += 1
-                        done += 1
-                        print(f"Engaged: {action_name} on {p.uri}")
-                        time.sleep(random.uniform(3.0, 8.0))
-
-                    if done >= target_n:
-                        break
-
-            save_state(state)
-
-            nap = random.uniform(*SLEEP_RANGE_SECONDS)
-            if random.random() < 0.18:
-                nap += random.uniform(20 * 60, 40 * 60)
-            if not (7 <= now_local.hour < 23):
-                nap = max(nap, random.uniform(70 * 60, 120 * 60))
-
-            print(f"Sleeping for ~{int(nap // 60)} min...")
-            time.sleep(nap)
-
-        except KeyboardInterrupt:
-            print("Stopping bot.")
-            break
-        except Exception as e:
-            print(f"[loop] Error: {e}", file=sys.stderr)
-            time.sleep(random.uniform(60, 180))
+        do_one_action(client, state, tz)
+        # si tu utilises loop localement, on dort entre 25–55 min
+        nap = random.uniform(25*60, 55*60)
+        if random.random() < 0.18:
+            nap += random.uniform(20*60, 40*60)
+        now_local = dt.datetime.now(tz)
+        if not (7 <= now_local.hour < 23):
+            nap = max(nap, random.uniform(70*60, 120*60))
+        print(f"Sleeping ~{int(nap//60)} min...")
+        time.sleep(nap)
 
 if __name__ == "__main__":
     main()

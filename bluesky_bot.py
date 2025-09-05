@@ -294,8 +294,19 @@ def post_text(client: Client, text: str, image_path: Optional[str] = None) -> Op
 
 @with_backoff
 def list_notifications(client: Client, limit: int = 50):
-    # SDK shape may vary; the call below matches atproto>=0.0.54+
-    return client.app.bsky.notification.list_notifications(limit=limit)
+    """Wrapper to handle SDK differences.
+    Some atproto versions don't accept keyword args and will bubble a
+    TypeError like: Client.request() got an unexpected keyword argument 'limit'.
+    In that case, call without kwargs.
+    """
+    try:
+        return client.app.bsky.notification.list_notifications(limit=limit)
+    except TypeError:
+        # Older SDK: no kwargs supported; returns default page size
+        return client.app.bsky.notification.list_notifications()
+    except Exception:
+        # As a last resort, try without kwargs
+        return client.app.bsky.notification.list_notifications()
 
 
 @with_backoff

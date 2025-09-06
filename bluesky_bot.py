@@ -1,6 +1,6 @@
 """
 Bluesky bot (Loufi’s Art / ArtLift) — Anti-spam safe, GitHub Actions friendly
-- Posts with strict mix: ~50% GM/GN image+emoji (time-aware), ~10% GM/GN long text, ~25% short link posts (site/OpenSea), ~15% reposts
+- Posts with strict mix: ~50% GM/GN image+emoji (time-aware), ~10% GM/GN long text, ~25% short link posts (raw blue URLs), ~15% reposts
 - Max 4 posts/day, no posts at night (23:00–07:00 Europe/Brussels)
 - Images are chosen from ./assets/posts and avoided if used in the last 14 days
 - Opt‑in engagements ONLY (mentions/replies to the bot). Likes are allowed; no unsolicited comments
@@ -46,7 +46,8 @@ SITE_URL = "https://louphi1987.github.io/Site_de_Louphi/"
 OPENSEA_URL = "https://opensea.io/collection/loufis-art"
 TIMEZONE = "Europe/Brussels"
 
-IMAGES_DIR = "assets/posts"
+# Use explicit relative path with leading ./ so assets sit next to the script path-wise
+IMAGES_DIR = "./assets/posts"
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png"}
 IMAGE_RECENCY_DAYS = 14
 
@@ -71,7 +72,7 @@ DELAY_ENGAGE_MAX_S = 45
 # Target mix for actions (approximate over time)
 #  - 50% GM/GN short with image + emoji (time-aware)
 #  - 10% GM/GN long
-#  - 25% short link (site/opensea)
+#  - 25% short link (SITE/OPENSEA) — **raw URLs only** so they render as blue links
 #  - 15% repost (timeline from followed)
 ACTION_WEIGHTS = {
     "post_img_gmgn_short": 0.50,
@@ -79,9 +80,6 @@ ACTION_WEIGHTS = {
     "post_short_link": 0.25,
     "repost": 0.15,
 }
-
-# Image attach for GM/GN (enforced for the 50% bucket)
-# We'll still allow occasional images for long GM/GN if available.
 
 # ========== TEXT LIBRARIES ==========
 GM_SHORT = [
@@ -105,12 +103,10 @@ GN_LONG = [
     "Resting the canvas for tomorrow’s colors. GN ✨",
 ]
 
-SHORT_LINK_TEXTS = [
-    "My universe → {site}",
-    "Gallery here → {site}",
-    "Collection on‑chain → {opensea}",
-    "My projects → {site}",
-    "NFT collection → {opensea}",
+# Link posts must include plain URLs so Bluesky auto-detects and shows blue links.
+LINK_POOLS = [
+    SITE_URL,
+    OPENSEA_URL,
 ]
 
 COMMENT_SHORT = [
@@ -359,10 +355,10 @@ def choose_action(now_local: dt.datetime) -> str:
     # Bias towards GM/GN buckets only when appropriate hours.
     weights = ACTION_WEIGHTS.copy()
     if in_time_window(now_local, "morning"):
-        # Morning → GM posts only
+        # Morning → GM posts only (kept as-is)
         pass
     elif in_time_window(now_local, "evening"):
-        # Evening → GN posts only
+        # Evening → GN posts only (kept as-is)
         pass
     else:
         # Midday → reduce GM/GN buckets, shift weight into links & reposts
@@ -416,10 +412,13 @@ def pick_gmgn_text(state: Dict[str, Any], now_local: dt.datetime, long: bool = F
 
 
 def pick_link_short(state: Dict[str, Any]) -> str:
-    t = pick_without_recent(state, SHORT_LINK_TEXTS)
-    if "opensea" in t.lower():
-        return t.format(opensea=OPENSEA_URL)
-    return t.format(site=SITE_URL)
+    # Always return a plain URL so Bluesky renders a blue link
+    pools = LINK_POOLS[:]
+    random.shuffle(pools)
+    for url in pools:
+        if not recently_used_text(state, url):
+            return url
+    return random.choice(LINK_POOLS)
 
 # ========== OPT‑IN ENGAGEMENTS (MENTIONS / REPLIES) ==========
 
@@ -552,14 +551,14 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
             # If we couldn't find a safe repost, fallback to link post
             action = "post_short_link"
 
-        text = None
-        image = None
+        text: Optional[str] = None
+        image: Optional[str] = None
 
         if action == "post_img_gmgn_short":
             text = pick_gmgn_text(state, now_local, long=False)
             image = pick_fresh_image(state)
             if image is None:
-                # If no image available, fallback to short link
+                # If no image available, fallback to short link (blue URL)
                 action = "post_short_link"
 
         if action == "post_gmgn_long":

@@ -47,7 +47,7 @@ OPENSEA_URL = "https://opensea.io/collection/loufis-art"
 TIMEZONE = "Europe/Brussels"
 
 # Use explicit relative path with leading ./ so assets sit next to the script path-wise
-IMAGES_DIR = "./assets/posts"
+IMAGES_DIR = "."
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png"}
 IMAGE_RECENCY_DAYS = 14
 

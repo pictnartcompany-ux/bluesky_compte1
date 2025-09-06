@@ -1,8 +1,9 @@
 """
 Bluesky bot (Loufi’s Art / ArtLift) — Anti-spam safe, GitHub Actions friendly
-- Posts (GM/GN/value/NFT) with image attach windows
-- Opt‑in engagements ONLY (mentions/replies to the bot)
-- No hashtag scraping; no unsolicited comments
+- Posts with strict mix: ~50% GM/GN image+emoji (time-aware), ~10% GM/GN long text, ~25% short link posts (site/OpenSea), ~15% reposts
+- Max 4 posts/day, no posts at night (23:00–07:00 Europe/Brussels)
+- Images are chosen from ./assets/posts and avoided if used in the last 14 days
+- Opt‑in engagements ONLY (mentions/replies to the bot). Likes are allowed; no unsolicited comments
 - Daily + hourly rate caps, random delays, 429 backoff
 - Anti‑repetition (text 7d, images 14d)
 - --oneshot mode for CI
@@ -25,13 +26,12 @@ import os
 import sys
 import json
 import time
-import math
 import random
 import argparse
 import datetime as dt
 import pathlib
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -50,11 +50,15 @@ IMAGES_DIR = "assets/posts"
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png"}
 IMAGE_RECENCY_DAYS = 14
 
-# Global daily caps (conservative)
+# Quiet hours: no posting at night
+NO_POST_START_HOUR = 23  # inclusive
+NO_POST_END_HOUR = 7     # exclusive
+
+# Global daily caps
 MAX_POSTS_PER_DAY = 4
 MAX_ENGAGEMENTS_PER_DAY = 10  # only opt-in mentions/replies
 
-# Hourly caps (very conservative to avoid bursty behavior)
+# Hourly caps (conservative)
 MAX_POSTS_PER_HOUR = 2
 MAX_ENGAGEMENTS_PER_HOUR = 3
 
@@ -64,57 +68,49 @@ DELAY_POST_MAX_S = 28
 DELAY_ENGAGE_MIN_S = 12
 DELAY_ENGAGE_MAX_S = 45
 
-# Weights for action selection (posting only; engagements depend on inbox)
-WEIGHTS = {
-    "post_gm": 0.28,
-    "post_value": 0.24,
-    "post_nft": 0.18,
-    "post_gn": 0.30,
+# Target mix for actions (approximate over time)
+#  - 50% GM/GN short with image + emoji (time-aware)
+#  - 10% GM/GN long
+#  - 25% short link (site/opensea)
+#  - 15% repost (timeline from followed)
+ACTION_WEIGHTS = {
+    "post_img_gmgn_short": 0.50,
+    "post_gmgn_long": 0.10,
+    "post_short_link": 0.25,
+    "repost": 0.15,
 }
 
-# Image attach probabilities
-ATTACH_IMAGE_PROB_MORNING_GM = 0.55  # 7–11h local
-ATTACH_IMAGE_PROB_EVENING_GN = 0.60  # 19–23h local
-ATTACH_IMAGE_PROB_OTHER = 0.15
-
-# Anti‑spam: engage only when user explicitly addressed the bot
-# We will consider notifications of type mention or reply.
-
-DISCOVERY_TAGS = []  # intentionally unused (no hashtag scraping)
+# Image attach for GM/GN (enforced for the 50% bucket)
+# We'll still allow occasional images for long GM/GN if available.
 
 # ========== TEXT LIBRARIES ==========
-GM_POSTS = [
-    "GM ☀️✨ Wishing everyone a day full of creativity and inspiration!",
-    "GM 🌊 Let’s dive into imagination today!",
-    "GM! New day, new brushstrokes 🖌️",
-    "GM 🌱 Keep growing your art, one idea at a time.",
-    "GM ✨ Creating stories in color and light today.",
+GM_SHORT = [
+    "GM ☀️",
+    "GM ✨",
+    "GM 🌞",
+    "GM 🌿",
+    "GM 👋",
 ]
-
 GN_SHORT_BASE = ["GN", "Gn", "gn", "Good night", "Night"]
 RANDOM_GN_EMOJIS = ["🌙", "✨", "⭐", "💤", "🌌", "🫶", "💫", "😴", "🌠"]
 
+GM_LONG = [
+    "GM 🌱 Wishing you a day full of creativity and light.",
+    "GM ✨ New day, new brushstrokes.",
+    "GM 🌊 Let's dive into imagination today.",
+]
 GN_LONG = [
     "Good night 🌙💫 May your dreams be as colorful as art.",
     "GN 🌌 See you in tomorrow’s stories.",
-    "Calling it a day — see you among the stars 🌠 GN!",
     "Resting the canvas for tomorrow’s colors. GN ✨",
 ]
 
-VALUE_POSTS = [
-    "Fiction isn’t just escape — it’s expansion. Art gives it a shape. 🎨✨ Explore my worlds: {site}",
-    "The best worlds are painted twice: once by the writer, once by the artist. {site}",
-    "Passion drives creation. My universe of art & fiction grows every day 💡 Browse: {site}",
-    "Art libraries are like portals. Step through: {site}",
-    "Stories in motion, colors in orbit — welcome to my creative vault: {site}",
-]
-
-NFT_POSTS = [
-    "New collectors, storytellers, dreamers… you’re welcome in Loufi’s Art 🌟 {opensea}",
-    "NFTs aren’t just tokens — they’re stories frozen in time. Latest pieces: {opensea}",
-    "Digital brushstrokes meet imagination 🚀 Collection: {opensea}",
-    "Curated fragments of my universes — now on-chain. Discover: {opensea}",
-    "If art is a portal, NFTs are the key 🔑 Unlock: {opensea}",
+SHORT_LINK_TEXTS = [
+    "Aperçu de mon univers → {site}",
+    "Galerie & histoires ici → {site}",
+    "Collection on‑chain → {opensea}",
+    "Portail vers mes œuvres → {site}",
+    "NFT collection → {opensea}",
 ]
 
 COMMENT_SHORT = [
@@ -152,7 +148,8 @@ def load_state() -> Dict[str, Any]:
         "history": [],
         "daily": {"date": "", "posts": 0, "engagements": 0},
         "hourly": {"key": "", "posts": 0, "engagements": 0},
-        "processed_notifications": [],  # to avoid double-engaging
+        "processed_notifications": [],
+        "recent_reposts": [],  # list of URIs
     }
 
 
@@ -165,6 +162,8 @@ def reset_daily_if_needed(state: Dict[str, Any], now_local: dt.datetime) -> None
     today = now_local.date().isoformat()
     if state["daily"].get("date") != today:
         state["daily"] = {"date": today, "posts": 0, "engagements": 0}
+        # trim repost memory daily as well
+        state["recent_reposts"] = state.get("recent_reposts", [])[-200:]
 
 
 def reset_hourly_if_needed(state: Dict[str, Any], now_local: dt.datetime) -> None:
@@ -294,18 +293,11 @@ def post_text(client: Client, text: str, image_path: Optional[str] = None) -> Op
 
 @with_backoff
 def list_notifications(client: Client, limit: int = 50):
-    """Wrapper to handle SDK differences.
-    Some atproto versions don't accept keyword args and will bubble a
-    TypeError like: Client.request() got an unexpected keyword argument 'limit'.
-    In that case, call without kwargs.
-    """
     try:
         return client.app.bsky.notification.list_notifications(limit=limit)
     except TypeError:
-        # Older SDK: no kwargs supported; returns default page size
         return client.app.bsky.notification.list_notifications()
     except Exception:
-        # As a last resort, try without kwargs
         return client.app.bsky.notification.list_notifications()
 
 
@@ -331,6 +323,17 @@ def reply_to_post(client: Client, parent_uri: str, parent_cid: str, text: str) -
     )
     return True
 
+
+# Timeline fetch for safe reposts (from followed accounts only)
+@with_backoff
+def get_timeline(client: Client, limit: int = 50):
+    try:
+        return client.get_timeline(limit=limit)
+    except Exception:
+        # Fallback to app namespace if SDK differs
+        return client.app.bsky.feed.get_timeline(limit=limit)
+
+
 # ========== CONTENT PICKERS ==========
 
 def in_time_window(now_local: dt.datetime, window: str) -> bool:
@@ -340,17 +343,38 @@ def in_time_window(now_local: dt.datetime, window: str) -> bool:
     if window == "evening":
         return 19 <= h < 23
     if window == "midday":
-        return 11 <= h < 16
+        return 11 <= h < 19
     return False
 
 
-def choose_post_kind(now_local: dt.datetime) -> str:
-    weights = WEIGHTS.copy()
+def is_quiet_hours(now_local: dt.datetime) -> bool:
+    h = now_local.hour
+    if NO_POST_START_HOUR <= NO_POST_END_HOUR:
+        return NO_POST_START_HOUR <= h < NO_POST_END_HOUR
+    # Wrap-around case
+    return h >= NO_POST_START_HOUR or h < NO_POST_END_HOUR
+
+
+def choose_action(now_local: dt.datetime) -> str:
+    # Bias towards GM/GN buckets only when appropriate hours.
+    weights = ACTION_WEIGHTS.copy()
     if in_time_window(now_local, "morning"):
-        weights["post_gm"] += 0.18
-        weights["post_gn"] -= 0.10
+        # Morning → GM posts only
+        pass
     elif in_time_window(now_local, "evening"):
-        weights["post_gn"] += 0.22
+        # Evening → GN posts only
+        pass
+    else:
+        # Midday → reduce GM/GN buckets, shift weight into links & reposts
+        shift = weights["post_img_gmgn_short"] * 0.8
+        weights["post_img_gmgn_short"] -= shift
+        weights["post_short_link"] += shift * 0.7
+        weights["repost"] += shift * 0.3
+        # Long GM/GN also reduced
+        shift2 = weights["post_gmgn_long"] * 0.7
+        weights["post_gmgn_long"] -= shift2
+        weights["post_short_link"] += shift2 * 0.7
+        weights["repost"] += shift2 * 0.3
 
     total = sum(weights.values())
     r = random.random() * total
@@ -359,7 +383,7 @@ def choose_post_kind(now_local: dt.datetime) -> str:
         cum += w
         if r <= cum:
             return k
-    return "post_value"
+    return "post_short_link"
 
 
 def pick_without_recent(state: Dict[str, Any], pool: List[str]) -> str:
@@ -371,31 +395,31 @@ def pick_without_recent(state: Dict[str, Any], pool: List[str]) -> str:
     return random.choice(pool)
 
 
+def build_gm_short() -> str:
+    return random.choice(GM_SHORT)
+
+
 def build_gn_short() -> str:
     base = random.choice(GN_SHORT_BASE)
-    if random.random() < 0.75:
+    if random.random() < 0.85:
         base = f"{base} {random.choice(RANDOM_GN_EMOJIS)}"
     return base
 
 
-def pick_post_text(state: Dict[str, Any], kind: str) -> str:
-    if kind == "post_gm":
-        return pick_without_recent(state, GM_POSTS)
-    if kind == "post_value":
-        return pick_without_recent(state, VALUE_POSTS).format(site=SITE_URL)
-    if kind == "post_nft":
-        return pick_without_recent(state, NFT_POSTS).format(opensea=OPENSEA_URL)
-    if kind == "post_gn":
-        return pick_without_recent(state, GN_LONG) if random.random() < 0.55 else build_gn_short()
-    return random.choice(VALUE_POSTS).format(site=SITE_URL)
+def pick_gmgn_text(state: Dict[str, Any], now_local: dt.datetime, long: bool = False) -> str:
+    if in_time_window(now_local, "morning"):
+        return pick_without_recent(state, GM_LONG) if long else build_gm_short()
+    if in_time_window(now_local, "evening"):
+        return pick_without_recent(state, GN_LONG) if long else build_gn_short()
+    # Outside GM/GN windows, default to short neutral GM
+    return build_gm_short()
 
 
-def should_attach_image(now_local: dt.datetime, kind: str) -> bool:
-    if kind == "post_gm":
-        return random.random() < (ATTACH_IMAGE_PROB_MORNING_GM if in_time_window(now_local, "morning") else ATTACH_IMAGE_PROB_OTHER)
-    if kind == "post_gn":
-        return random.random() < (ATTACH_IMAGE_PROB_EVENING_GN if in_time_window(now_local, "evening") else ATTACH_IMAGE_PROB_OTHER)
-    return random.random() < ATTACH_IMAGE_PROB_OTHER
+def pick_link_short(state: Dict[str, Any]) -> str:
+    t = pick_without_recent(state, SHORT_LINK_TEXTS)
+    if "opensea" in t.lower():
+        return t.format(opensea=OPENSEA_URL)
+    return t.format(site=SITE_URL)
 
 # ========== OPT‑IN ENGAGEMENTS (MENTIONS / REPLIES) ==========
 
@@ -405,23 +429,12 @@ def fetch_unprocessed_mentions(client: Client, state: Dict[str, Any], handle: st
     processed = set(state.get("processed_notifications", []))
     fresh = []
     for n in items:
-        # n.reason can be 'mention', 'reply', 'quote', 'like', 'repost', 'follow'
         reason = getattr(n, "reason", None)
         if reason not in ("mention", "reply"):
             continue
-        if getattr(n, "isRead", False):
-            # even if read, process only once
-            pass
         nid = getattr(n, "cid", None) or getattr(n, "id", None) or getattr(n, "uri", None)
         if not nid or nid in processed:
             continue
-        # Basic guard: ensure the post text contains our handle if reason==reply (optional)
-        post = getattr(n, "record", None)
-        # Some SDK versions expose the post text at n.record.text; we keep it optional
-        txt = getattr(post, "text", "") if post else ""
-        if reason == "reply" and handle not in (txt or ""):
-            # allow replies even if handle not explicitly present; opt-in via thread
-            pass
         fresh.append(n)
     return fresh
 
@@ -440,6 +453,39 @@ def engage_for_notification(client: Client, n) -> Optional[str]:
         reply_to_post(client, uri, cid, reply)
         return f"reply:{reply}"
 
+# ========== SAFE REPOST PICKER ==========
+
+def pick_safe_repost(client: Client, state: Dict[str, Any], handle: str):
+    tl = get_timeline(client, limit=50)
+    feed = getattr(tl, "feed", []) or []
+    recent_reposts = set(state.get("recent_reposts", []))
+    # Iterate random order to avoid always top items
+    random.shuffle(feed)
+    for item in feed:
+        post = getattr(item, "post", None)
+        if not post:
+            continue
+        author = getattr(post, "author", None)
+        if not author:
+            continue
+        did = getattr(author, "did", None)
+        handle_self = os.getenv("BSKY_HANDLE", "").strip()
+        # Skip own posts
+        if getattr(author, "handle", "") == handle_self:
+            continue
+        uri = getattr(post, "uri", None)
+        cid = getattr(post, "cid", None)
+        if not uri or not cid:
+            continue
+        if uri in recent_reposts:
+            continue
+        # Avoid posts that are themselves reposts
+        reason = getattr(item, "reason", None)
+        if reason and getattr(reason, "$type", "").endswith("#reasonRepost"):
+            continue
+        return uri, cid
+    return None
+
 # ========== ACTION ENGINE ==========
 
 def can_post(state: Dict[str, Any]) -> bool:
@@ -457,7 +503,7 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
 
     handle = os.getenv("BSKY_HANDLE", "").strip()
 
-    # 1) Opt‑in engagements from mentions/replies
+    # 1) Opt‑in engagements from mentions/replies (likes allowed)
     if can_engage(state):
         fresh_mentions = fetch_unprocessed_mentions(client, state, handle, limit=40)
         random.shuffle(fresh_mentions)
@@ -465,7 +511,6 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
             n = fresh_mentions[0]
             kind = engage_for_notification(client, n)
             if kind:
-                # mark processed
                 nid = getattr(n, "cid", None) or getattr(n, "id", None) or getattr(n, "uri", None)
                 if nid:
                     state.setdefault("processed_notifications", []).append(nid)
@@ -478,13 +523,54 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
                 time.sleep(nap)
                 return "engaged"
 
-    # 2) Posting (only if allowed by caps)
-    if can_post(state):
-        kind = choose_post_kind(now_local)
-        text = pick_post_text(state, kind)
+    # 2) Posting (only if allowed by caps and not during quiet hours)
+    if can_post(state) and not is_quiet_hours(now_local):
+        action = choose_action(now_local)
+
+        # If action is GM/GN but outside windows, degrade to link
+        if action in ("post_img_gmgn_short", "post_gmgn_long") and not (in_time_window(now_local, "morning") or in_time_window(now_local, "evening")):
+            action = "post_short_link"
+
+        if action == "repost":
+            pick = pick_safe_repost(client, state, handle)
+            if pick:
+                uri, cid = pick
+                try:
+                    repost_post(client, uri, cid)
+                    state.setdefault("recent_reposts", []).append(uri)
+                    state["recent_reposts"] = state["recent_reposts"][-400:]
+                    state["daily"]["posts"] += 1
+                    state["hourly"]["posts"] += 1
+                    save_state(state)
+                    nap = random.uniform(DELAY_POST_MIN_S, DELAY_POST_MAX_S)
+                    print(f"Reposted {uri}. Sleeping ~{int(nap)}s…")
+                    time.sleep(nap)
+                    return "reposted"
+                except Exception as e:
+                    print(f"[repost] error: {e}", file=sys.stderr)
+                    # fall through to a normal post if repost failed
+            # If we couldn't find a safe repost, fallback to link post
+            action = "post_short_link"
+
+        text = None
         image = None
-        if kind in ("post_gm", "post_gn") and should_attach_image(now_local, kind):
+
+        if action == "post_img_gmgn_short":
+            text = pick_gmgn_text(state, now_local, long=False)
             image = pick_fresh_image(state)
+            if image is None:
+                # If no image available, fallback to short link
+                action = "post_short_link"
+
+        if action == "post_gmgn_long":
+            text = pick_gmgn_text(state, now_local, long=True)
+            # occasional image attach (~30%) if available
+            if random.random() < 0.30:
+                image = pick_fresh_image(state)
+
+        if action == "post_short_link":
+            text = pick_link_short(state)
+
         try:
             uri = post_text(client, text, image)
         except Exception as e:
@@ -502,8 +588,7 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
         print("Post failed")
         return "post_failed"
 
-    # 3) Nothing to do within safe limits
-    print("Nothing to do (caps reached / no mentions)")
+    print("Nothing to do (caps reached / quiet hours / no mentions)")
     return "skip"
 
 # ========== MAIN ==========
@@ -530,17 +615,16 @@ def main():
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            # On unexpected error, cool down generously
             cool = random.uniform(60, 120)
             print(f"[Loop warn] {e}. Cooling down {int(cool)}s", file=sys.stderr)
             time.sleep(cool)
-        # Between cycles, sleep a broader window depending on day time
         now_local = dt.datetime.now(tz)
-        if 7 <= now_local.hour < 23:
+        if is_quiet_hours(now_local):
+            nap = random.uniform(70*60, 120*60)
+        elif 7 <= now_local.hour < 23:
             nap = random.uniform(25*60, 55*60)
         else:
-            nap = random.uniform(70*60, 120*60)
-        # occasional extra long nap
+            nap = random.uniform(45*60, 80*60)
         if random.random() < 0.18:
             nap += random.uniform(20*60, 40*60)
         print(f"Sleeping ~{int(nap//60)} min…")

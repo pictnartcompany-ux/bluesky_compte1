@@ -106,10 +106,10 @@ GN_LONG = [
 ]
 
 SHORT_LINK_TEXTS = [
-    "Aperçu de mon univers → {site}",
-    "Galerie & histoires ici → {site}",
+    "My universe → {site}",
+    "Gallery here → {site}",
     "Collection on‑chain → {opensea}",
-    "Portail vers mes œuvres → {site}",
+    "My projects → {site}",
     "NFT collection → {opensea}",
 ]
 

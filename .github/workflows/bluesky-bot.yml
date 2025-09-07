@@ -2,10 +2,10 @@ name: Bluesky Bot (Loufi's Art)
 
 on:
   schedule:
-    - cron: "30 6 * * *"   # 08:30 Brussels
-    - cron: "30 10 * * *"  # 12:30 Brussels
-    - cron: "30 17 * * *"  # 19:30 Brussels
-    - cron: "30 19 * * *"  # 21:30 Brussels
+    - cron: "32 7 * * *"   # 08:32 Brussels (winter)
+    - cron: "26 11 * * *"  # 12:26 Brussels (winter)
+    - cron: "15 18 * * *"  # 19:15 Brussels (winter)
+    - cron: "44 20 * * *"  # 21:44 Brussels (winter)
   workflow_dispatch: {}
 
 concurrency:

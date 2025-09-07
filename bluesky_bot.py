@@ -1,13 +1,14 @@
 """
-Bluesky bot (Loufi’s Art / ArtLift) — Anti-spam safe, GitHub Actions friendly
+Bluesky bot (Loufi’s Art / ArtLift) — Images + Reposts focused
 - Max 4 posts/day, no posts at night (23:00–07:00 Europe/Brussels)
-- 2 image GM/GN max/jour (1 matin, 1 soir), 2 liens max/jour, 1 long max/jour, le reste = reposts
-- Créneaux souples (matin/midi/soir) + délais aléatoires → fluidité, pas d’effet “minuteur”
-- Images choisies depuis ./assets/posts et évitées si utilisées dans les 14 derniers jours
-- Opt-in engagements ONLY (mentions/replies). Likes autorisés ; pas de commentaires non sollicités
-- Daily + hourly rate caps, random delays, 429 backoff
-- Anti-répétition (texte 7j, images 14j)
-- --oneshot mode pour CI
+- PRIORITY = images (GM/GN) + safe reposts
+- Weekly links: at most 1 plain URL every ≥7 days, **never at midday** (11:00–19:00)
+- No GM/GN long texts (disabled)
+- Anti-repeat: 
+  • Avoid same action twice in a row (e.g., no two reposts back-to-back)
+  • Text not reused for 7 days, images for 14 days
+- Soft, random delays; hourly/daily caps; 429 backoff
+- --oneshot mode for CI
 
 Local usage:
   pip install atproto
@@ -16,11 +17,11 @@ Local usage:
   python bluesky_bot_safe.py --oneshot
 
 Images:
-  - Mettre les images dans ./assets/posts/ (jpg/jpeg/png)
+  - Put images in ./assets/posts/ (jpg/jpeg/png)
 
 Notes:
-  - Bio claire sur Bluesky : "Automated account — contact @YourHuman".
-  - Respect des normes communautaires ; interactions opt-in uniquement.
+  - Bio on Bluesky: "Automated account — contact @YourHuman".
+  - Respect community norms; interactions are opt-in only.
 """
 
 import os
@@ -72,8 +73,13 @@ DELAY_ENGAGE_MAX_S = 45
 
 # ======== CAPS PAR TYPE ========
 MAX_IMG_GMGN_PER_DAY = 2      # 1 le matin + 1 le soir (au total 2)
-MAX_SHORT_LINK_PER_DAY = 2    # liens bleus max/jour
-MAX_GMGN_LONG_PER_DAY = 1     # texte long max/jour
+MAX_SHORT_LINK_PER_DAY = 1    # runtime-gated by weekly rule (≤1 link per 7 days)
+MAX_GMGN_LONG_PER_DAY = 0     # Désactivé
+
+# Weekly link rule
+WEEKLY_LINK_MIN_DAYS = 7
+ALLOW_LINK_MORNING_HOURS = (7, 11)    # [7,11)
+ALLOW_LINK_EVENING_HOURS = (19, 23)   # [19,23)
 
 # ========== TEXT LIBRARIES ==========
 GM_SHORT = [
@@ -85,17 +91,6 @@ GM_SHORT = [
 ]
 GN_SHORT_BASE = ["GN", "Gn", "gn", "Good night", "Night"]
 RANDOM_GN_EMOJIS = ["🌙", "✨", "⭐", "💤", "🌌", "🫶", "💫", "😴", "🌠"]
-
-GM_LONG = [
-    "GM 🌱 Wishing you a day full of creativity and light.",
-    "GM ✨ New day, new brushstrokes.",
-    "GM 🌊 Let's dive into imagination today.",
-]
-GN_LONG = [
-    "Good night 🌙💫 May your dreams be as colorful as art.",
-    "GN 🌌 See you in tomorrow’s stories.",
-    "Resting the canvas for tomorrow’s colors. GN ✨",
-]
 
 # Link posts must include plain URLs so Bluesky auto-detects and shows blue links.
 LINK_POOLS = [
@@ -143,6 +138,8 @@ def load_state() -> Dict[str, Any]:
                 state.setdefault("processed_notifications", [])
                 state.setdefault("recent_reposts", [])
                 state.setdefault("pertype", _pertype_zero())
+                state.setdefault("last_link_date", "")
+                state.setdefault("act_hist", [])  # list of recent action names
                 return state
             except Exception:
                 pass
@@ -153,6 +150,8 @@ def load_state() -> Dict[str, Any]:
         "processed_notifications": [],
         "recent_reposts": [],  # list of URIs
         "pertype": _pertype_zero(),
+        "last_link_date": "",
+        "act_hist": [],
     }
 
 
@@ -177,13 +176,24 @@ def reset_hourly_if_needed(state: Dict[str, Any], now_local: dt.datetime) -> Non
         state["hourly"] = {"key": key, "posts": 0, "engagements": 0}
 
 
-def remember_post(state: Dict[str, Any], text: str, media: Optional[str] = None) -> None:
+def _push_action_hist(state: Dict[str, Any], action: str) -> None:
+    state.setdefault("act_hist", []).append(action)
+    state["act_hist"] = state["act_hist"][-8:]
+
+
+def last_action(state: Dict[str, Any]) -> Optional[str]:
+    hist = state.get("act_hist", [])
+    return hist[-1] if hist else None
+
+
+def remember_post(state: Dict[str, Any], text: str, action: str, media: Optional[str] = None) -> None:
     now = dt.datetime.now(tz=dt.timezone.utc).isoformat()
-    rec = {"text": text, "ts": now}
+    rec = {"text": text, "ts": now, "action": action}
     if media:
         rec["media"] = media
     state["history"].append(rec)
     state["history"] = state["history"][-400:]
+    _push_action_hist(state, action)
 
 
 def recently_used_text(state: Dict[str, Any], text: str, days: int = 7) -> bool:
@@ -380,12 +390,12 @@ def build_gn_short() -> str:
     return base
 
 
-def pick_gmgn_text(state: Dict[str, Any], now_local: dt.datetime, long: bool = False) -> str:
+def pick_gmgn_text(state: Dict[str, Any], now_local: dt.datetime) -> str:
     if in_time_window(now_local, "morning"):
-        return pick_without_recent(state, GM_LONG) if long else build_gm_short()
+        return build_gm_short()
     if in_time_window(now_local, "evening"):
-        return pick_without_recent(state, GN_LONG) if long else build_gn_short()
-    # Outside GM/GN windows, default to short neutral GM
+        return build_gn_short()
+    # Outside GM/GN windows, default to neutral GM
     return build_gm_short()
 
 
@@ -398,44 +408,71 @@ def pick_link_short(state: Dict[str, Any]) -> str:
             return url
     return random.choice(LINK_POOLS)
 
+# ========== WEEKLY LINK LOGIC ==========
+
+def can_post_weekly_link(state: Dict[str, Any], now_local: dt.datetime) -> bool:
+    # No links during midday window, ever
+    if in_time_window(now_local, "midday"):
+        return False
+    last = state.get("last_link_date", "")
+    if last:
+        try:
+            last_d = dt.date.fromisoformat(last)
+        except Exception:
+            last_d = None
+        if last_d:
+            if (now_local.date() - last_d).days < WEEKLY_LINK_MIN_DAYS:
+                return False
+    # Also respect per-day cap
+    if state.get("pertype", {}).get("post_short_link", 0) >= MAX_SHORT_LINK_PER_DAY:
+        return False
+    return True
+
 # ========== ACTION SELECTION WITH CAPS ==========
 
-def choose_action_with_caps(now_local: dt.datetime, pertype: Dict[str, int]) -> str:
-    h = now_local.hour
+def _avoid_same_action(action: str, state: Dict[str, Any]) -> str:
+    last = last_action(state)
+    if not last:
+        return action
+    if action == last:
+        # Prefer switching between image and repost
+        if action == "repost":
+            return "post_img_gmgn_short"
+        if action == "post_img_gmgn_short":
+            return "repost"
+        # for other cases, fall back to repost
+        return "repost"
+    return action
 
-    # Matin 07–11 : prioriser 1 image GM si pas encore postée
-    if 7 <= h < 11:
+
+def choose_action_with_caps(now_local: dt.datetime, state: Dict[str, Any]) -> str:
+    pertype = state.get("pertype", _pertype_zero())
+
+    # Morning 07–11: prioritize 1 image; optionally weekly link if allowed; else repost
+    if 7 <= now_local.hour < 11:
         if pertype["post_img_gmgn_short"] < MAX_IMG_GMGN_PER_DAY and pertype["post_img_gmgn_short"] == 0:
             return "post_img_gmgn_short"
-        if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
+        if can_post_weekly_link(state, now_local):
             return "post_short_link"
-        if pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-            return "post_gmgn_long"
         return "repost"
 
-    # Milieu de journée 11–19 : liens d'abord (cap 2), sinon long (cap 1), sinon repost
-    if 11 <= h < 19:
-        if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
-            return "post_short_link"
-        if pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-            return "post_gmgn_long"
-        return "repost"
-
-    # Soir 19–23 : prioriser 2e image GN si encore dispo
-    if 19 <= h < 23:
+    # Midday 11–19: **no links**; prefer repost; if image quota left, allow one image (rare)
+    if 11 <= now_local.hour < 19:
+        if pertype["repost"] < MAX_POSTS_PER_DAY:  # soft guard
+            return "repost"
         if pertype["post_img_gmgn_short"] < MAX_IMG_GMGN_PER_DAY:
             return "post_img_gmgn_short"
-        if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
-            return "post_short_link"
-        if pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-            return "post_gmgn_long"
         return "repost"
 
-    # En dehors (au cas où) : fallback sobre
-    if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
-        return "post_short_link"
-    if pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-        return "post_gmgn_long"
+    # Evening 19–23: prioritize 2nd image; else repost; link allowed weekly (not midday)
+    if 19 <= now_local.hour < 23:
+        if pertype["post_img_gmgn_short"] < MAX_IMG_GMGN_PER_DAY:
+            return "post_img_gmgn_short"
+        if can_post_weekly_link(state, now_local):
+            return "post_short_link"
+        return "repost"
+
+    # Outside windows: default to repost
     return "repost"
 
 # ========== OPT-IN ENGAGEMENTS (MENTIONS / REPLIES) ==========
@@ -541,27 +578,8 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
 
     # 2) Posting (only if allowed by caps and not during quiet hours)
     if can_post(state) and not is_quiet_hours(now_local):
-        # choisir l'action selon créneaux + caps
-        pertype = state.get("pertype", _pertype_zero())
-        action = choose_action_with_caps(now_local, pertype)
-
-        # Fallback global si un type dépasse son cap exact au moment d'exécuter
-        def downgrade_from(action_name: str) -> str:
-            if action_name == "post_img_gmgn_short":
-                if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
-                    return "post_short_link"
-                if pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-                    return "post_gmgn_long"
-                return "repost"
-            if action_name == "post_gmgn_long":
-                if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
-                    return "post_short_link"
-                return "repost"
-            if action_name == "post_short_link":
-                if pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-                    return "post_gmgn_long"
-                return "repost"
-            return "repost"
+        action = choose_action_with_caps(now_local, state)
+        action = _avoid_same_action(action, state)
 
         text: Optional[str] = None
         image: Optional[str] = None
@@ -578,6 +596,7 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
                     state["daily"]["posts"] += 1
                     state["hourly"]["posts"] += 1
                     state["pertype"]["repost"] = state.get("pertype", {}).get("repost", 0) + 1
+                    remember_post(state, text=f"REPOST:{uri}", action="repost")
                     save_state(state)
                     nap = random.uniform(DELAY_POST_MIN_S, DELAY_POST_MAX_S)
                     print(f"Reposted {uri}. Sleeping ~{int(nap)}s…")
@@ -585,37 +604,22 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
                     return "reposted"
                 except Exception as e:
                     print(f"[repost] error: {e}", file=sys.stderr)
-            # If we couldn't find a safe repost or failed, tente un lien si dispo
-            if pertype["post_short_link"] < MAX_SHORT_LINK_PER_DAY:
-                action = "post_short_link"
-            elif pertype["post_gmgn_long"] < MAX_GMGN_LONG_PER_DAY:
-                action = "post_gmgn_long"
-            else:
-                # rien d'autre à faire proprement
-                print("Nothing to repost or fallback. Skipping.")
-                return "skip"
+            # If we couldn't find a safe repost or failed, try image if available, else skip
+            action = "post_img_gmgn_short"
 
         # Préparation selon action
         if action == "post_img_gmgn_short":
-            text = pick_gmgn_text(state, now_local, long=False)
-            image = pick_fresh_image(state)
-            if image is None:
-                # dégrader si pas d'image fraîche dispo
-                action = downgrade_from("post_img_gmgn_short")
-
-        if action == "post_gmgn_long":
-            # check cap runtime
-            if pertype["post_gmgn_long"] >= MAX_GMGN_LONG_PER_DAY:
-                action = downgrade_from("post_gmgn_long")
+            if state.get("pertype", {}).get("post_img_gmgn_short", 0) >= MAX_IMG_GMGN_PER_DAY:
+                action = "repost"
             else:
-                text = pick_gmgn_text(state, now_local, long=True)
-                if random.random() < 0.30:
-                    image = pick_fresh_image(state)
+                text = pick_gmgn_text(state, now_local)
+                image = pick_fresh_image(state)
+                if image is None:
+                    action = "repost"
 
         if action == "post_short_link":
-            # check cap runtime
-            if pertype["post_short_link"] >= MAX_SHORT_LINK_PER_DAY:
-                action = downgrade_from("post_short_link")
+            if not can_post_weekly_link(state, now_local):
+                action = "repost"
             else:
                 text = pick_link_short(state)
 
@@ -631,6 +635,7 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
                     state["daily"]["posts"] += 1
                     state["hourly"]["posts"] += 1
                     state["pertype"]["repost"] = state.get("pertype", {}).get("repost", 0) + 1
+                    remember_post(state, text=f"REPOST:{uri}", action="repost")
                     save_state(state)
                     nap = random.uniform(DELAY_POST_MIN_S, DELAY_POST_MAX_S)
                     print(f"Reposted {uri}. Sleeping ~{int(nap)}s…")
@@ -643,7 +648,6 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
 
         # Poster texte/image
         if not text and action != "repost":
-            # Sécurité: si rien n'a été préparé (rare), on saute
             print("No content prepared for action. Skipping.")
             return "skip"
 
@@ -654,11 +658,13 @@ def do_one_action(client: Client, state: Dict[str, Any], tz: ZoneInfo) -> str:
             return "post_failed"
 
         if uri:
-            remember_post(state, text, media=image)
+            remember_post(state, text, action=action, media=image)
             state["daily"]["posts"] += 1
             state["hourly"]["posts"] += 1
             # incrément per-type
             state["pertype"][action] = state.get("pertype", {}).get(action, 0) + 1
+            if action == "post_short_link":
+                state["last_link_date"] = now_local.date().isoformat()
             save_state(state)
             nap = random.uniform(DELAY_POST_MIN_S, DELAY_POST_MAX_S)
             print(f"Posted: {text[:80]}{'…' if len(text)>80 else ''} {'[+image]' if image else ''}\nSleeping ~{int(nap)}s…")

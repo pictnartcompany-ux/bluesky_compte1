@@ -4,17 +4,17 @@ Bluesky bot (Loufi’s Art / ArtLift) — Images + Reposts focused
 - PRIORITY = images (GM/GN) + safe reposts
 - Weekly links: at most 1 plain URL every ≥7 days, **never at midday** (11:00–19:00)
 - No GM/GN long texts (disabled)
-- Anti-repeat: 
+- Anti-repeat:
   • Avoid same action twice in a row (e.g., no two reposts back-to-back)
   • Text not reused for 7 days, images for 14 days
 - Soft, random delays; hourly/daily caps; 429 backoff
-- --oneshot mode for CI
+- --oneshot mode for CI (hard runtime cap < 10 min)
 
 Local usage:
   pip install atproto
   export BSKY_HANDLE=your_handle.bsky.social
   export BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-  python bluesky_bot_safe.py --oneshot
+  python bluesky_bot.py --oneshot
 
 Images:
   - Put images in ./assets/posts/ (jpg/jpeg/png)
@@ -65,11 +65,11 @@ MAX_ENGAGEMENTS_PER_DAY = 10  # only opt-in mentions/replies
 MAX_POSTS_PER_HOUR = 2
 MAX_ENGAGEMENTS_PER_HOUR = 3
 
-# Random delay windows
-DELAY_POST_MIN_S = 8
-DELAY_POST_MAX_S = 28
-DELAY_ENGAGE_MIN_S = 12
-DELAY_ENGAGE_MAX_S = 45
+# Random delay windows (légèrement réduits pour CI)
+DELAY_POST_MIN_S = 6
+DELAY_POST_MAX_S = 20
+DELAY_ENGAGE_MIN_S = 8
+DELAY_ENGAGE_MAX_S = 30
 
 # ======== CAPS PAR TYPE ========
 MAX_IMG_GMGN_PER_DAY = 2      # 1 le matin + 1 le soir (au total 2)
@@ -80,6 +80,12 @@ MAX_GMGN_LONG_PER_DAY = 0     # Désactivé
 WEEKLY_LINK_MIN_DAYS = 7
 ALLOW_LINK_MORNING_HOURS = (7, 11)    # [7,11)
 ALLOW_LINK_EVENING_HOURS = (19, 23)   # [19,23)
+
+# ======== ONESHOT RUNTIME CAP (CI) ========
+# Par défaut: 7 min (420s) pour rester largement sous le timeout 10 min du runner.
+# Ajustable via variable d'env MAX_ONESHOT_SECONDS si besoin.
+MAX_ONESHOT_SECONDS = int(os.getenv("MAX_ONESHOT_SECONDS", "420"))
+DEADLINE_MONO: Optional[float] = None  # fixé dans main() si --oneshot
 
 # ========== TEXT LIBRARIES ==========
 GM_SHORT = [
@@ -256,26 +262,67 @@ def _needs_backoff(exc: Exception) -> bool:
     return "429" in msg or "ratelimit" in msg or "rate limit" in msg
 
 
+def _get_retry_after_seconds(exc: Exception) -> Optional[float]:
+    # Essaie d’extraire Retry-After si exposé par le SDK
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            hdrs = getattr(resp, "headers", {}) or {}
+            ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+            if ra:
+                try:
+                    return float(ra)
+                except Exception:
+                    # parfois c'est une date, on ignore
+                    return None
+    except Exception:
+        pass
+    return None
+
+
 def with_backoff(fn):
     def wrapper(*args, **kwargs):
-        delay = 5.0
+        delay_base = 5.0
         tries = 0
         while True:
             try:
                 return fn(*args, **kwargs)
             except Exception as e:
                 tries += 1
+
+                # 429 / rate limit -> backoff exponentiel (capé), ou Retry-After si dispo
                 if _needs_backoff(e):
-                    sleep_s = min(delay * (2 ** (tries - 1)), 60.0)
+                    retry_after = _get_retry_after_seconds(e)
+                    if retry_after is not None:
+                        sleep_s = max(0.0, min(retry_after, 45.0))
+                    else:
+                        sleep_s = min(delay_base * (2 ** (tries - 1)), 45.0)
+
+                    # Respecter le deadline si on est en --oneshot
+                    global DEADLINE_MONO
+                    if DEADLINE_MONO is not None:
+                        now = time.monotonic()
+                        if now + sleep_s >= DEADLINE_MONO:
+                            print("[BACKOFF] Oneshoot deadline reached; exiting gracefully.", file=sys.stderr)
+                            sys.exit(0)  # fin propre, pas d'échec
                     print(f"[BACKOFF] Rate limited; sleeping {sleep_s:.1f}s", file=sys.stderr)
                     time.sleep(sleep_s)
                     continue
-                # transient network errors: brief retry
+
+                # autres erreurs transitoires: 2 retries courts
                 if tries <= 2:
                     sleep_s = 2.0 * tries
+                    global DEADLINE_MONO
+                    if DEADLINE_MONO is not None:
+                        now = time.monotonic()
+                        if now + sleep_s >= DEADLINE_MONO:
+                            print("[RETRY] Oneshoot deadline reached; exiting gracefully.", file=sys.stderr)
+                            sys.exit(0)
                     print(f"[RETRY] {e}; sleeping {sleep_s:.1f}s", file=sys.stderr)
                     time.sleep(sleep_s)
                     continue
+
+                # au-delà: on remonte l’erreur
                 raise
     return wrapper
 
@@ -684,6 +731,15 @@ def main():
     parser.add_argument("--oneshot", action="store_true", help="Perform one safe action and exit (CI mode)")
     parser.add_argument("--loop", action="store_true", help="Run continuous loop with sleeps (local use)")
     args = parser.parse_args()
+
+    # --- DEADLINE pour --oneshot ---
+    global DEADLINE_MONO
+    if args.oneshot:
+        DEADLINE_MONO = time.monotonic() + MAX_ONESHOT_SECONDS
+        # Petit jitter pour désaligner avec d'autres crons
+        time.sleep(random.uniform(0.5, 3.0))
+    else:
+        DEADLINE_MONO = None
 
     tz = ZoneInfo(TIMEZONE)
     client = bsky_login()

@@ -290,7 +290,6 @@ def with_backoff(fn):
             except Exception as e:
                 tries += 1
 
-                # 429 / rate limit -> backoff exponentiel (capé), ou Retry-After si dispo
                 if _needs_backoff(e):
                     retry_after = _get_retry_after_seconds(e)
                     if retry_after is not None:
@@ -298,21 +297,18 @@ def with_backoff(fn):
                     else:
                         sleep_s = min(delay_base * (2 ** (tries - 1)), 45.0)
 
-                    # Respecter le deadline si on est en --oneshot
-                    global DEADLINE_MONO
+                    # lecture simple: pas besoin de 'global'
                     if DEADLINE_MONO is not None:
                         now = time.monotonic()
                         if now + sleep_s >= DEADLINE_MONO:
                             print("[BACKOFF] Oneshoot deadline reached; exiting gracefully.", file=sys.stderr)
-                            sys.exit(0)  # fin propre, pas d'échec
+                            sys.exit(0)
                     print(f"[BACKOFF] Rate limited; sleeping {sleep_s:.1f}s", file=sys.stderr)
                     time.sleep(sleep_s)
                     continue
 
-                # autres erreurs transitoires: 2 retries courts
                 if tries <= 2:
                     sleep_s = 2.0 * tries
-                    global DEADLINE_MONO
                     if DEADLINE_MONO is not None:
                         now = time.monotonic()
                         if now + sleep_s >= DEADLINE_MONO:
@@ -322,7 +318,6 @@ def with_backoff(fn):
                     time.sleep(sleep_s)
                     continue
 
-                # au-delà: on remonte l’erreur
                 raise
     return wrapper
 
